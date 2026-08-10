@@ -1,0 +1,291 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # CONTRIBUTING.md asks contributors to run both before committing, but the
+      # pre-commit hook only covers fmt and `--no-verify` skips it entirely.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Covers the contract, indexer, and relayer crates via the workspace lockfile.
+      - name: Audit Rust dependencies
+        run: cargo audit --deny warnings
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Audit SDK dependencies
+        working-directory: sdk
+        run: npm audit --audit-level=high
+
+  contract:
+    name: Soroban Contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build contract
+        run: cargo build -p onboarding-bridge --release
+
+      - name: Build WASM (release)
+        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
+
+      - name: Verify WASM Hash
+        run: |
+          COMPUTED_HASH=$(sha256sum target/wasm32-unknown-unknown/release/onboarding_bridge.wasm | cut -d' ' -f1)
+          if [ ! -f wasm_hash.txt ]; then
+            echo "::error::wasm_hash.txt not found!"
+            exit 1
+          fi
+          KNOWN_HASH=$(cat wasm_hash.txt | xargs)
+          echo "Computed WASM Hash: $COMPUTED_HASH"
+          echo "Known Good Hash:    $KNOWN_HASH"
+          if [ "$COMPUTED_HASH" != "$KNOWN_HASH" ]; then
+            echo "::error::Compiled WASM hash ($COMPUTED_HASH) does not match the known good hash ($KNOWN_HASH)!"
+            echo "If this change was intentional, please update the hash in wasm_hash.txt."
+            exit 1
+          fi
+
+      - name: Run contract tests
+        run: cargo test -p onboarding-bridge --features testutils
+
+      - name: Run benchmarks
+        run: |
+          cargo test -p onboarding-bridge --features testutils bench_ -- --nocapture 2>/dev/null \
+            | grep '^BENCH' \
+            | awk 'BEGIN{print "function\tcpu_instructions\tmemory_bytes"} {print $2"\t"$3"\t"$4}' \
+            > bench_results.txt
+          echo "--- Benchmark Results ---"
+          column -t bench_results.txt
+
+      - name: Check gas regressions
+        run: |
+          if [ -f bench_baseline.txt ]; then
+            python3 - <<'EOF'
+          import sys
+          baseline = {}
+          invalid_baselines = []
+          with open("bench_baseline.txt") as f:
+              next(f)  # skip header
+              for line_no, line in enumerate(f, start=2):
+                  parts = line.strip().split("\t")
+                  if len(parts) == 3:
+                      cpu, mem = int(parts[1]), int(parts[2])
+                      baseline[parts[0]] = (cpu, mem)
+                      if cpu == 0 and mem == 0:
+                          invalid_baselines.append(f"{line_no}: {parts[0]}")
+
+          if invalid_baselines:
+              print("INVALID BENCHMARK BASELINE: zero cpu/memory rows found:")
+              for row in invalid_baselines:
+                  print(" ", row)
+              sys.exit(1)
+
+          results = {}
+          with open("bench_results.txt") as f:
+              next(f)  # skip header
+              for line in f:
+                  parts = line.strip().split("\t")
+                  if len(parts) == 3:
+                      results[parts[0]] = (int(parts[1]), int(parts[2]))
+
+          THRESHOLD = 0.20  # 20% regression threshold
+          regressions = []
+          for name, (cpu, mem) in results.items():
+              if name in baseline:
+                  base_cpu, base_mem = baseline[name]
+                  if base_cpu > 0 and (cpu - base_cpu) / base_cpu > THRESHOLD:
+                      regressions.append(f"{name}: CPU {base_cpu} -> {cpu} (+{(cpu-base_cpu)*100//base_cpu}%)")
+                  if base_mem > 0 and (mem - base_mem) / base_mem > THRESHOLD:
+                      regressions.append(f"{name}: MEM {base_mem} -> {mem} (+{(mem-base_mem)*100//base_mem}%)")
+
+          if regressions:
+              print("GAS REGRESSIONS DETECTED (>20% increase):")
+              for r in regressions:
+                  print(" ", r)
+              sys.exit(1)
+          else:
+              print("No gas regressions detected.")
+          EOF
+          else
+            echo "No baseline file found — saving current results as baseline."
+            cp bench_results.txt bench_baseline.txt
+          fi
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench_results.txt
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onboarding-bridge-wasm
+          path: target/wasm32-unknown-unknown/release/*.wasm
+
+  contract-compatibility:
+    name: Contract Compatibility (Soroban SDK ${{ matrix.soroban-sdk-version }}.x)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The contract uses SDK 22 APIs (Env::register, cost_estimate);
+        # majors 20/21 cannot compile it and were removed from the matrix.
+        soroban-sdk-version: ["22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Pin Soroban SDK major version
+        run: |
+          sed -i -E "s/^soroban-sdk = \".*\"$/soroban-sdk = \"${{ matrix.soroban-sdk-version }}\"/" contracts/onboarding-bridge/Cargo.toml
+          sed -i -E "s/^soroban-sdk = \{ version = \".*\", features = \[\"testutils\"\] \}$/soroban-sdk = { version = \"${{ matrix.soroban-sdk-version }}\", features = [\"testutils\"] }/" contracts/onboarding-bridge/Cargo.toml
+
+      - name: Update lockfile for selected Soroban SDK
+        run: cargo update -p soroban-sdk --workspace
+
+      - name: Show resolved Soroban SDK version
+        run: cargo tree -p onboarding-bridge -e normal,dev | grep soroban-sdk | head -n 2
+
+      - name: Build contract
+        run: cargo build -p onboarding-bridge --release
+
+      # The upgrade tests include_bytes! the compiled wasm; build it first.
+      - name: Build WASM fixture for tests
+        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
+
+      - name: Run contract tests
+        run: cargo test -p onboarding-bridge --features testutils
+
+  sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: sdk/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('sdk/package-lock.json') }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type-check
+        run: npx tsc --noEmit
+
+      - name: Build SDK
+        run: npm run build
+
+  sdk-matrix:
+    name: SDK Compatibility Matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+        npm-version: [9, 10]
+      fail-fast: false
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Setup npm ${{ matrix.npm-version }}
+        run: npm install -g npm@${{ matrix.npm-version }}
+
+      - name: Display versions
+        run: |
+          node --version
+          npm --version
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: sdk/node_modules
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-npm-${{ matrix.npm-version }}-${{ hashFiles('sdk/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.node-version }}-npm-
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type-check
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build SDK
+        run: npm run build
